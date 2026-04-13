@@ -363,3 +363,67 @@ fn raw_query_helpers_accept_tuple_params() {
     assert_eq!(from_step.len(), 1);
     assert_eq!(from_step[0].code, 100_000_001);
 }
+
+#[test]
+fn find_all_resolves_rule_codes() {
+    let mut cdb = ygopro_cdb_encode_rs::YgoProCdb::new().expect("create cdb");
+    cdb.add_cards(&[
+        CardDataEntry {
+            code: 10_000,
+            type_: TYPE_MONSTER,
+            name: "Original".to_string(),
+            ..Default::default()
+        },
+        CardDataEntry {
+            code: 20_000,
+            alias: 10_000,
+            type_: TYPE_MONSTER,
+            name: "Alt 1".to_string(),
+            ..Default::default()
+        },
+        CardDataEntry {
+            code: 20_001,
+            alias: 20_000,
+            type_: TYPE_MONSTER,
+            name: "Alt 2".to_string(),
+            ..Default::default()
+        },
+    ])
+    .expect("insert cards");
+
+    let all = cdb.find_all().expect("find_all");
+    let alt2 = all.iter().find(|c| c.code == 20_001).expect("find alt2");
+    // Before the fix, find_all() did NOT call resolve_rule_codes,
+    // so rule_code would have been 0. Now it should be properly resolved.
+    assert_eq!(alt2.alias, 20_000);
+    assert_eq!(alt2.rule_code, 10_000);
+}
+
+#[test]
+fn filter_value_serde_preserves_unsigned() {
+    // Non-negative integers should deserialize as Unsigned
+    let json_42 = serde_json::json!(42);
+    let val: FilterValue = serde_json::from_value(json_42).expect("deserialize 42");
+    assert_eq!(val, FilterValue::Unsigned(42));
+
+    // Negative integers should deserialize as Integer
+    let json_neg = serde_json::json!(-5);
+    let val: FilterValue = serde_json::from_value(json_neg).expect("deserialize -5");
+    assert_eq!(val, FilterValue::Integer(-5));
+
+    // Large u64 values should be preserved
+    let large: u64 = u64::MAX;
+    let json_large = serde_json::json!(large);
+    let val: FilterValue = serde_json::from_value(json_large).expect("deserialize large u64");
+    assert_eq!(val, FilterValue::Unsigned(large));
+
+    // Null should deserialize as Null
+    let json_null = serde_json::json!(null);
+    let val: FilterValue = serde_json::from_value(json_null).expect("deserialize null");
+    assert_eq!(val, FilterValue::Null);
+
+    // String should deserialize as Text
+    let json_str = serde_json::json!("hello");
+    let val: FilterValue = serde_json::from_value(json_str).expect("deserialize string");
+    assert_eq!(val, FilterValue::Text("hello".to_string()));
+}

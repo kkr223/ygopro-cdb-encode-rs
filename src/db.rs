@@ -127,12 +127,14 @@ impl YgoProCdb {
     }
 
     pub fn find_all(&self) -> Result<Vec<CardDataEntry>> {
-        query_cards(
+        let mut cards = query_cards(
             &self.conn,
             "1=1 ORDER BY datas.id",
             &HashMap::new(),
             self.no_texts,
-        )
+        )?;
+        self.resolve_rule_codes(&mut cards)?;
+        Ok(cards)
     }
 
     pub fn query_raw(
@@ -276,59 +278,80 @@ impl YgoProCdb {
         alias_ids.sort_unstable();
         alias_ids.dedup();
 
-        let mut resolved = HashMap::new();
-        for alias_id in alias_ids {
-            let rule_code = self.resolve_rule_code_for_alias(alias_id)?;
-            resolved.insert(alias_id, rule_code);
+        // Batch-load all alias targets and their chains in one pass.
+        // We collect all relevant rows into memory, then resolve chains
+        // without additional queries.
+        let mut alias_map: HashMap<u32, (u32, u32)> = HashMap::new(); // id -> (normalized_alias, rule_code)
+        let mut to_fetch = alias_ids.clone();
+        let mut fetched = std::collections::BTreeSet::new();
+
+        // Iteratively fetch batches until no new IDs are discovered.
+        while !to_fetch.is_empty() {
+            let placeholders: String = to_fetch.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!("SELECT id, alias, type FROM datas WHERE id IN ({placeholders})");
+            let mut stmt = self.conn.prepare(&sql)?;
+            for (i, id) in to_fetch.iter().enumerate() {
+                stmt.raw_bind_parameter(i + 1, i64::from(*id))?;
+            }
+            let mut rows = stmt.raw_query();
+            let mut next_fetch = Vec::new();
+            while let Some(row) = rows.next()? {
+                let code = row.get::<_, i64>(0)? as u32;
+                let alias = row.get::<_, i64>(1)? as u32;
+                let type_value = row.get::<_, i64>(2)? as u32;
+                let (normalized_alias, rule_code) = normalize_alias_rule(code, alias, type_value);
+                alias_map.insert(code, (normalized_alias, rule_code));
+                fetched.insert(code);
+                // If this row itself has an alias chain, schedule it for the next batch
+                if rule_code == 0 && normalized_alias != 0 && !fetched.contains(&normalized_alias) {
+                    next_fetch.push(normalized_alias);
+                }
+            }
+            next_fetch.sort_unstable();
+            next_fetch.dedup();
+            to_fetch = next_fetch;
+        }
+
+        // Resolve chains in memory with cycle detection.
+        let mut resolved_cache: HashMap<u32, u32> = HashMap::new();
+        for &start_id in &alias_ids {
+            if resolved_cache.contains_key(&start_id) {
+                continue;
+            }
+            let mut current = start_id;
+            let mut visited = std::collections::BTreeSet::new();
+            let result = loop {
+                if !visited.insert(current) {
+                    break 0; // cycle
+                }
+                if let Some(cached) = resolved_cache.get(&current) {
+                    break *cached;
+                }
+                match alias_map.get(&current) {
+                    Some(&(_, rule_code)) if rule_code != 0 => break rule_code,
+                    Some(&(normalized_alias, _)) if normalized_alias != 0 => {
+                        current = normalized_alias;
+                    }
+                    _ => break 0,
+                }
+            };
+            // Cache all visited nodes
+            for id in visited {
+                resolved_cache.insert(id, result);
+            }
         }
 
         for card in cards.iter_mut() {
             if card.rule_code == 0 && card.alias != 0 {
-                if let Some(rule_code) = resolved.get(&card.alias).copied().filter(|value| *value != 0)
-                {
-                    card.rule_code = rule_code;
+                if let Some(&rule_code) = resolved_cache.get(&card.alias) {
+                    if rule_code != 0 {
+                        card.rule_code = rule_code;
+                    }
                 }
             }
         }
 
         Ok(())
-    }
-
-    fn resolve_rule_code_for_alias(&self, alias_id: u32) -> Result<u32> {
-        let mut current_id = alias_id;
-        let mut visited = std::collections::BTreeSet::new();
-
-        loop {
-            if !visited.insert(current_id) {
-                return Ok(0);
-            }
-
-            let sql = "SELECT id, alias, type FROM datas WHERE id = :id LIMIT 1";
-            let mut stmt = self.conn.prepare(sql)?;
-            if let Some(index) = stmt.parameter_index(":id")? {
-                stmt.raw_bind_parameter(index, i64::from(current_id))?;
-            }
-
-            let mut rows = stmt.raw_query();
-            let Some(row) = rows.next()? else {
-                return Ok(0);
-            };
-
-            let code = row.get::<_, i64>("id")? as u32;
-            let alias = row.get::<_, i64>("alias")? as u32;
-            let type_value = row.get::<_, i64>("type")? as u32;
-            let (normalized_alias, rule_code) = normalize_alias_rule(code, alias, type_value);
-
-            if rule_code != 0 {
-                return Ok(rule_code);
-            }
-
-            if normalized_alias == 0 {
-                return Ok(0);
-            }
-
-            current_id = normalized_alias;
-        }
     }
 }
 
@@ -455,43 +478,54 @@ fn query_cards(
     Ok(cards)
 }
 
+/// Column layout (0-indexed):
+///  0: datas.id       1: datas.ot      2: datas.alias   3: datas.setcode
+///  4: datas.type     5: datas.atk     6: datas.def     7: datas.level
+///  8: datas.race     9: datas.attribute  10: datas.category
+/// 11: texts.name    12: texts.desc
+/// 13..28: texts.str1 .. texts.str16
 fn card_from_row(row: &rusqlite::Row<'_>) -> Result<CardDataEntry> {
-    let code = row.get::<_, i64>("id")? as u32;
-    let type_value = row.get::<_, i64>("type")? as u32;
-    let mut defense = row.get::<_, i64>("def")? as i32;
-    let mut link_marker = 0_u32;
+    let code = row.get::<_, i64>(0)? as u32;
+    let ot = row.get::<_, i64>(1)? as u32;
+    let alias_raw = row.get::<_, i64>(2)? as u32;
+    let setcode_raw = row.get::<_, i64>(3)?;
+    let type_value = row.get::<_, i64>(4)? as u32;
+    let attack = row.get::<_, i64>(5)? as i32;
+    let mut defense = row.get::<_, i64>(6)? as i32;
+    let level_raw = row.get::<_, i64>(7)? as u32;
+    let race = row.get::<_, i64>(8)? as u32;
+    let attribute = row.get::<_, i64>(9)? as u32;
+    let category = row.get::<_, i64>(10)? as u64;
+    let name: String = row.get::<_, Option<String>>(11)?.unwrap_or_default();
+    let desc: String = row.get::<_, Option<String>>(12)?.unwrap_or_default();
 
+    let mut link_marker = 0_u32;
     if (type_value & TYPE_LINK) != 0 {
         link_marker = defense.max(0) as u32;
         defense = 0;
     }
 
-    let level_raw = row.get::<_, i64>("level")? as u32;
-    let alias_raw = row.get::<_, i64>("alias")? as u32;
     let (alias, rule_code) = normalize_alias_rule(code, alias_raw, type_value);
 
     let mut strings = Vec::with_capacity(16);
-    for index in 1..=16 {
-        strings.push(
-            row.get::<_, Option<String>>(format!("str{index}").as_str())?
-                .unwrap_or_default(),
-        );
+    for col in 13..29 {
+        strings.push(row.get::<_, Option<String>>(col)?.unwrap_or_default());
     }
 
     Ok(CardDataEntry {
         code,
         alias,
-        setcode: decode_setcode(row.get::<_, i64>("setcode")?),
+        setcode: decode_setcode(setcode_raw),
         type_: type_value,
-        attack: row.get::<_, i64>("atk")? as i32,
+        attack,
         defense,
         level: level_raw & 0xff,
-        race: row.get::<_, i64>("race")? as u32,
-        attribute: row.get::<_, i64>("attribute")? as u32,
-        category: row.get::<_, i64>("category")? as u64,
-        ot: row.get::<_, i64>("ot")? as u32,
-        name: row.get::<_, Option<String>>("name")?.unwrap_or_default(),
-        desc: row.get::<_, Option<String>>("desc")?.unwrap_or_default(),
+        race,
+        attribute,
+        category,
+        ot,
+        name,
+        desc,
         strings,
         lscale: (level_raw >> 24) & 0xff,
         rscale: (level_raw >> 16) & 0xff,

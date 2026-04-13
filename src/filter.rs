@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value as JsonValue;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum FilterValue {
     Null,
     Integer(i64),
@@ -12,6 +12,71 @@ pub enum FilterValue {
     Float(f64),
     Bool(bool),
     Text(String),
+}
+
+impl Serialize for FilterValue {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Self::Null => serializer.serialize_none(),
+            Self::Integer(v) => serializer.serialize_i64(*v),
+            Self::Unsigned(v) => serializer.serialize_u64(*v),
+            Self::Float(v) => serializer.serialize_f64(*v),
+            Self::Bool(v) => serializer.serialize_bool(*v),
+            Self::Text(v) => serializer.serialize_str(v),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for FilterValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct FilterValueVisitor;
+
+        impl<'de> Visitor<'de> for FilterValueVisitor {
+            type Value = FilterValue;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a filter value (null, bool, number, or string)")
+            }
+
+            fn visit_unit<E: de::Error>(self) -> std::result::Result<FilterValue, E> {
+                Ok(FilterValue::Null)
+            }
+
+            fn visit_none<E: de::Error>(self) -> std::result::Result<FilterValue, E> {
+                Ok(FilterValue::Null)
+            }
+
+            fn visit_bool<E: de::Error>(self, v: bool) -> std::result::Result<FilterValue, E> {
+                Ok(FilterValue::Bool(v))
+            }
+
+            fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<FilterValue, E> {
+                if v >= 0 {
+                    Ok(FilterValue::Unsigned(v as u64))
+                } else {
+                    Ok(FilterValue::Integer(v))
+                }
+            }
+
+            fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<FilterValue, E> {
+                Ok(FilterValue::Unsigned(v))
+            }
+
+            fn visit_f64<E: de::Error>(self, v: f64) -> std::result::Result<FilterValue, E> {
+                Ok(FilterValue::Float(v))
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<FilterValue, E> {
+                Ok(FilterValue::Text(v.to_string()))
+            }
+
+            fn visit_string<E: de::Error>(self, v: String) -> std::result::Result<FilterValue, E> {
+                Ok(FilterValue::Text(v))
+            }
+        }
+
+        deserializer.deserialize_any(FilterValueVisitor)
+    }
 }
 
 impl FilterValue {
