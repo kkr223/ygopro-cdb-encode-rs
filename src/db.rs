@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::HashMap, fs, path::Path};
+use std::{cell::RefCell, collections::HashMap, fs, path::{Path, PathBuf}};
 
 use regex::Regex;
 use rusqlite::{Connection, Statement, functions::FunctionFlags};
@@ -75,8 +75,9 @@ const INSERT_TEXTS_STMT: &str = concat!(
 
 #[derive(Debug)]
 pub struct YgoProCdb {
-    temp_file: NamedTempFile,
+    _temp_file: Option<NamedTempFile>,
     conn: Connection,
+    db_path: PathBuf,
     no_texts: bool,
 }
 
@@ -98,10 +99,12 @@ impl SqlBuildContext {
 impl YgoProCdb {
     pub fn new() -> Result<Self> {
         let temp_file = NamedTempFile::new()?;
-        let conn = open_connection(temp_file.path())?;
+        let db_path = temp_file.path().to_path_buf();
+        let conn = open_connection(&db_path)?;
         Ok(Self {
-            temp_file,
+            _temp_file: Some(temp_file),
             conn,
+            db_path,
             no_texts: false,
         })
     }
@@ -109,10 +112,12 @@ impl YgoProCdb {
     pub fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self> {
         let temp_file = NamedTempFile::new()?;
         fs::write(temp_file.path(), bytes)?;
-        let conn = open_connection(temp_file.path())?;
+        let db_path = temp_file.path().to_path_buf();
+        let conn = open_connection(&db_path)?;
         Ok(Self {
-            temp_file,
+            _temp_file: Some(temp_file),
             conn,
+            db_path,
             no_texts: false,
         })
     }
@@ -121,9 +126,54 @@ impl YgoProCdb {
         Self::from_bytes(fs::read(path)?)
     }
 
+    /// Open a database file directly at the given path without creating
+    /// a temporary copy. The caller is responsible for managing the file's
+    /// lifecycle (e.g. copying it elsewhere for working-copy semantics).
+    pub fn from_path_direct(path: impl AsRef<Path>) -> Result<Self> {
+        let db_path = path.as_ref().to_path_buf();
+        let conn = open_connection(&db_path)?;
+        Ok(Self {
+            _temp_file: None,
+            conn,
+            db_path,
+            no_texts: false,
+        })
+    }
+
+    /// Create a new empty database at the given path. If a file already
+    /// exists at `path`, it is removed first.
+    pub fn create_at_path(path: impl AsRef<Path>) -> Result<Self> {
+        let db_path = path.as_ref().to_path_buf();
+        if let Some(parent) = db_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if db_path.exists() {
+            fs::remove_file(&db_path)?;
+        }
+        let conn = open_connection(&db_path)?;
+        Ok(Self {
+            _temp_file: None,
+            conn,
+            db_path,
+            no_texts: false,
+        })
+    }
+
     pub fn export(&self) -> Result<Vec<u8>> {
         self.conn.execute_batch("PRAGMA optimize;")?;
-        Ok(fs::read(self.temp_file.path())?)
+        Ok(fs::read(&self.db_path)?)
+    }
+
+    /// Copy the current database to the given file path.
+    pub fn export_to_path(&self, path: impl AsRef<Path>) -> Result<()> {
+        self.conn.execute_batch("PRAGMA optimize;")?;
+        fs::copy(&self.db_path, path)?;
+        Ok(())
+    }
+
+    /// Returns the path of the underlying database file.
+    pub fn path(&self) -> &Path {
+        &self.db_path
     }
 
     pub fn find_all(&self) -> Result<Vec<CardDataEntry>> {
@@ -182,6 +232,48 @@ impl YgoProCdb {
         self.query_raw_one(where_clause, &params)
     }
 
+    pub fn count_raw(
+        &self,
+        where_clause: &str,
+        params: &HashMap<String, JsonValue>,
+    ) -> Result<u32> {
+        count_cards(&self.conn, where_clause, params, self.no_texts)
+    }
+
+    pub fn count_raw_with<I, K>(
+        &self,
+        where_clause: &str,
+        params: I,
+    ) -> Result<u32>
+    where
+        I: IntoIterator<Item = (K, JsonValue)>,
+        K: Into<String>,
+    {
+        let params = collect_json_params(params);
+        self.count_raw(where_clause, &params)
+    }
+
+    pub fn query_raw_page(
+        &self,
+        where_clause: &str,
+        params: &HashMap<String, JsonValue>,
+        page: u32,
+        page_size: u32,
+    ) -> Result<(Vec<CardDataEntry>, u32)> {
+        let total = count_cards(&self.conn, where_clause, params, self.no_texts)?;
+        let page = page.max(1);
+        let offset = (page - 1) * page_size;
+        let clause = if where_clause.trim().is_empty() {
+            "1=1".to_string()
+        } else {
+            where_clause.trim().to_string()
+        };
+        let paged_clause = format!("{clause} ORDER BY datas.id LIMIT {page_size} OFFSET {offset}");
+        let mut cards = query_cards(&self.conn, &paged_clause, params, self.no_texts)?;
+        self.resolve_rule_codes(&mut cards)?;
+        Ok((cards, total))
+    }
+
     pub fn find(&self, filter: &FindFilter) -> Result<Vec<CardDataEntry>> {
         let (sql, params) = build_filter_sql(filter, self.no_texts)?;
         self.query_raw(&sql, &params)
@@ -235,6 +327,36 @@ impl YgoProCdb {
         Ok(Some(card))
     }
 
+    pub fn find_by_ids(&self, ids: &[u32]) -> Result<Vec<CardDataEntry>> {
+        let unique_ids: Vec<u32> = ids
+            .iter()
+            .copied()
+            .filter(|id| *id > 0)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if unique_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let placeholders: String = unique_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "{} WHERE datas.id IN ({placeholders}) ORDER BY datas.id",
+            select_card_columns(self.no_texts)
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        for (i, id) in unique_ids.iter().enumerate() {
+            stmt.raw_bind_parameter(i + 1, i64::from(*id))?;
+        }
+        let mut rows = stmt.raw_query();
+        let mut cards = Vec::new();
+        while let Some(row) = rows.next()? {
+            cards.push(card_from_row(row)?);
+        }
+        self.resolve_rule_codes(&mut cards)?;
+        Ok(cards)
+    }
+
     pub fn add_card(&mut self, card: CardDataEntry) -> Result<()> {
         upsert_cards(&mut self.conn, &[card], self.no_texts)
     }
@@ -249,6 +371,21 @@ impl YgoProCdb {
 
     pub fn remove_card(&mut self, code: u32) -> Result<()> {
         delete_cards_by_id(&mut self.conn, &[code])
+    }
+
+    pub fn remove_cards(&mut self, codes: &[u32]) -> Result<()> {
+        delete_cards_by_id(&mut self.conn, codes)
+    }
+
+    /// Atomically restore cards and delete cards in a single transaction.
+    /// Used by undo systems to guarantee that either both operations succeed
+    /// or neither does.
+    pub fn undo_modify(
+        &mut self,
+        cards_to_restore: &[CardDataEntry],
+        ids_to_delete: &[u32],
+    ) -> Result<()> {
+        undo_modify_operation(&mut self.conn, cards_to_restore, ids_to_delete, self.no_texts)
     }
 
     pub fn no_texts(&mut self, value: bool) -> Result<&mut Self> {
@@ -414,7 +551,9 @@ fn open_connection(path: &Path) -> Result<Connection> {
         "PRAGMA journal_mode=DELETE; \
      PRAGMA synchronous=NORMAL; \
      PRAGMA temp_store=MEMORY; \
-     PRAGMA foreign_keys=OFF;",
+     PRAGMA foreign_keys=OFF; \
+     PRAGMA mmap_size=268435456; \
+     PRAGMA cache_size=-20000;",
     )?;
     conn.execute_batch(CREATE_TABLE_STMT)?;
     conn.execute_batch(INSERT_EMPTY_TEXTS_FROM_DATAS_STMT)?;
@@ -627,6 +766,85 @@ fn delete_cards_by_id(conn: &mut Connection, card_ids: &[u32]) -> Result<()> {
                 }
                 other => Err(other),
             })?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn count_cards(
+    conn: &Connection,
+    where_clause: &str,
+    params: &HashMap<String, JsonValue>,
+    no_texts: bool,
+) -> Result<u32> {
+    ensure_clause_supported(where_clause, no_texts)?;
+    let from_clause = if no_texts {
+        "FROM datas"
+    } else {
+        "FROM datas INNER JOIN texts ON datas.id = texts.id"
+    };
+    let sql = format!(
+        "SELECT COUNT(*) {} WHERE {}",
+        from_clause,
+        sanitize_clause(where_clause)
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    bind_json_params(&mut stmt, params)?;
+    let mut rows = stmt.raw_query();
+    let Some(row) = rows.next()? else {
+        return Ok(0);
+    };
+    let total: i64 = row.get(0)?;
+    Ok(total.max(0) as u32)
+}
+
+fn undo_modify_operation(
+    conn: &mut Connection,
+    cards_to_restore: &[CardDataEntry],
+    ids_to_delete: &[u32],
+    no_texts: bool,
+) -> Result<()> {
+    let tx = conn.transaction()?;
+    {
+        if !cards_to_restore.is_empty() {
+            let mut stmt_datas = tx.prepare(INSERT_DATAS_STMT)?;
+            let mut stmt_texts = if no_texts {
+                None
+            } else {
+                Some(tx.prepare(INSERT_TEXTS_STMT)?)
+            };
+            for card in cards_to_restore {
+                if let Some(ref mut stmt_texts) = stmt_texts {
+                    write_card(&mut stmt_datas, stmt_texts, card)?;
+                } else {
+                    stmt_datas.execute(rusqlite::params![
+                        i64::from(card.code),
+                        i64::from(card.ot),
+                        i64::from(card.stored_alias()),
+                        card.packed_setcode(),
+                        i64::from(card.type_),
+                        i64::from(card.attack),
+                        i64::from(card.stored_defense()),
+                        i64::from(card.packed_level()),
+                        i64::from(card.race),
+                        i64::from(card.attribute),
+                        card.category as i64,
+                    ])?;
+                }
+            }
+        }
+        for card_id in ids_to_delete {
+            tx.execute("DELETE FROM datas WHERE id = ?", [i64::from(*card_id)])?;
+            tx.execute("DELETE FROM texts WHERE id = ?", [i64::from(*card_id)])
+                .or_else(|err| match err {
+                    rusqlite::Error::SqliteFailure(_, Some(message))
+                        if message.contains("no such table: texts") =>
+                    {
+                        Ok(0)
+                    }
+                    other => Err(other),
+                })?;
+        }
     }
     tx.commit()?;
     Ok(())
