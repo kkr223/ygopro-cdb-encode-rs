@@ -3,8 +3,13 @@ name = "ygopro-cdb-encode-rs"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Rust encoder/decoder and query helpers for YGOPro CDB files"
-repository = "https://github.com/placeholder/ygopro-cdb-encode-rs"
+description = "A Rust encoder, decoder and query library for YGOPro CDB databases"
+repository = "https://github.com/kkr223/ygopro-cdb-encode-rs"
+homepage = "https://github.com/kkr223/ygopro-cdb-encode-rs"
+documentation = "https://docs.rs/ygopro-cdb-encode-rs"
+readme = "README.md"
+keywords = ["yugioh", "ygopro", "cdb", "database", "sqlite"]
+categories = ["database-interface", "encoding"]
 
 [dependencies]
 regex = "1.12.2"
@@ -13,3 +18,4 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 tempfile = "3.23.0"
 thiserror = "2.0.17"
+
